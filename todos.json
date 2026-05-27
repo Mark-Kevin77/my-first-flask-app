@@ -1,4 +1,10 @@
 [
-  "学Flask",
-  "学Git"
+  {
+    "text": "学Flask",
+    "done": false
+  },
+  {
+    "text": "学Git",
+    "done": true
+  }
 ]
