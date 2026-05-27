@@ -1,44 +1,42 @@
 from flask import Flask, request, render_template_string, redirect, url_for, jsonify
-import json
+from flask_sqlalchemy import SQLAlchemy
 import os
 
 app = Flask(__name__)
 
-DATA_FILE = 'todos.json'
+# 数据库配置：使用项目根目录下的 todos.db
+basedir = os.path.abspath(os.path.dirname(__file__))
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///' + os.path.join(basedir, 'todos.db')
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
+db = SQLAlchemy(app)
 
-def load_todos():
-    """每次从文件读取，避免全局状态问题"""
-    if os.path.exists(DATA_FILE):
-        try:
-            with open(DATA_FILE, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                # 兼容旧格式（纯字符串列表）
-                if data and isinstance(data[0], str):
-                    return [{'text': t, 'done': False} for t in data]
-                return data
-        except (json.JSONDecodeError, IndexError):
-            return []
-    return []
+# 定义 Todo 数据模型
+class Todo(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    text = db.Column(db.String(200), nullable=False)
+    done = db.Column(db.Boolean, default=False)
 
+    def to_dict(self):
+        return {'id': self.id, 'text': self.text, 'done': self.done}
 
-def save_todos(todos):
-    with open(DATA_FILE, 'w', encoding='utf-8') as f:
-        json.dump(todos, f, ensure_ascii=False, indent=2)
-
+# 初始化数据库表（仅在首次运行时创建）
+with app.app_context():
+    db.create_all()
 
 @app.route('/', methods=['GET', 'POST'])
 def index():
+    # PRG模式：添加后重定向，防止刷新重复提交
     if request.method == 'POST':
         task = request.form.get('task', '').strip()
         if task:
-            todos = load_todos()
-            todos.append({'text': task, 'done': False})
-            save_todos(todos)
+            new_todo = Todo(text=task, done=False)
+            db.session.add(new_todo)
+            db.session.commit()
         return redirect(url_for('index'))
 
-    # GET 请求正常渲染
-    todos = load_todos()
+    # GET 请求：从数据库查询所有待办
+    todos = Todo.query.order_by(Todo.id.desc()).all()
 
     html = '''
     <!DOCTYPE html>
@@ -68,10 +66,10 @@ def index():
             {% for t in todos %}
                 <li>
                     <input type="checkbox"
-                           onchange="toggleDone({{ loop.index0 }}, this.checked)"
+                           onchange="toggleDone({{ t.id }}, this.checked)"
                            {{ 'checked' if t.done else '' }}>
                     <span class="{{ 'done' if t.done else '' }}">{{ t.text }}</span>
-                    <a href="/delete/{{ loop.index0 }}" class="delete"
+                    <a href="/delete/{{ t.id }}" class="delete"
                        onclick="return confirm('确定删除吗？')">删除</a>
                 </li>
             {% endfor %}
@@ -80,21 +78,18 @@ def index():
             <p style="color:#999; text-align:center;">暂无待办事项 🎉</p>
         {% endif %}
         <script>
-            function toggleDone(index, isDone) {
-                fetch('/toggle/' + index, {
+            function toggleDone(id, isDone) {
+                fetch('/toggle/' + id, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ done: isDone })
                 }).then(function(response) {
                     if (response.ok) {
+                        // 保持 location.replace 避免刷新重放POST
                         window.location.replace(window.location.href);
                     } else {
                         alert('操作失败，请重试');
-                        location.reload();
                     }
-                }).catch(function() {
-                    alert('网络错误');
-                    location.reload();
                 });
             }
         </script>
@@ -103,28 +98,22 @@ def index():
     '''
     return render_template_string(html, todos=todos)
 
-
-@app.route('/delete/<int:task_id>')
-def delete(task_id):
-    todos = load_todos()
-    if 0 <= task_id < len(todos):
-        todos.pop(task_id)
-        save_todos(todos)
+@app.route('/delete/<int:todo_id>')
+def delete(todo_id):
+    todo = Todo.query.get_or_404(todo_id)
+    db.session.delete(todo)
+    db.session.commit()
     return redirect(url_for('index'))
 
-
-@app.route('/toggle/<int:task_id>', methods=['POST'])
-def toggle(task_id):
-    todos = load_todos()
-    if 0 <= task_id < len(todos):
-        data = request.get_json(silent=True)
-        if data is None:
-            return jsonify({'error': 'Invalid JSON'}), 400
-        todos[task_id]['done'] = bool(data.get('done', False))
-        save_todos(todos)
-        return jsonify({'status': 'ok'})
-    return jsonify({'error': 'Task not found'}), 404
-
+@app.route('/toggle/<int:todo_id>', methods=['POST'])
+def toggle(todo_id):
+    todo = Todo.query.get_or_404(todo_id)
+    data = request.get_json(silent=True)
+    if data is None:
+        return jsonify({'error': 'Invalid JSON'}), 400
+    todo.done = bool(data.get('done', False))
+    db.session.commit()
+    return jsonify({'status': 'ok'})
 
 if __name__ == '__main__':
     app.run(debug=True)
