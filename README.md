@@ -33,3 +33,23 @@ python -m venv venv
 # 3. 安装依赖并启动
 pip install -r requirements.txt
 python app.py
+
+## 本地运行指南
+
+（前面的 git clone、venv、pip install 代码块）
+
+访问 http://localhost:5000 即可体验。
+
+## 线上演示
+
+- **体验地址**：http://markkevin77.pythonanywhere.com
+- **测试账号**：可自行注册新账号体验数据隔离功能
+
+## 项目结构
+
+```text
+my-first-flask-app/
+├── app.py              # 主应用（路由、模型、模板）
+├── requirements.txt    # 依赖清单
+├── .gitignore          # Git 忽略规则
+└── README.md           # 项目文档
