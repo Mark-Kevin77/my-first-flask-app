@@ -39,8 +39,8 @@ python app.py
 
 ## 线上演示
 
-- 🔗 **体验地址**：http://markkevin77.pythonanywhere.com
-- 👤 **测试账号**：可自行注册新账号体验数据隔离功能
+- **体验地址**：http://markkevin77.pythonanywhere.com
+- **测试账号**：可自行注册新账号体验数据隔离功能
 
 ## 项目结构
 
