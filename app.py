@@ -14,6 +14,11 @@ app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db = SQLAlchemy(app)
 login_manager = LoginManager(app)
 login_manager.login_view = 'login'
+@login_manager.unauthorized_handler
+def unauthorized():
+    if request.path.startswith('/api/'):
+        return api_response(message="unauthorized", code=401)
+    return redirect(url_for('login'))
 
 
 class User(UserMixin, db.Model):
@@ -293,6 +298,94 @@ function toggleDone(id, isDone) {{
 }}
 </script>
 </body></html>'''
+
+# ==================== P4: RESTful API ====================
+from flask import jsonify
+
+# 统一 JSON 响应封装
+def api_response(data=None, message="ok", code=200):
+    return jsonify({"code": code, "message": message, "data": data}), code
+
+# ---------- Todo API ----------
+@app.route('/api/v1/todos', methods=['GET'])
+@login_required
+def api_get_todos():
+    cat_id = request.args.get('cat', type=int)
+    query = Todo.query.filter_by(user_id=current_user.id)
+    if cat_id:
+        query = query.filter_by(category_id=cat_id)
+    todos = query.order_by(Todo.id.desc()).all()
+    result = [{
+        "id": t.id,
+        "text": t.text,
+        "done": t.done,
+        "category_id": t.category_id,
+        "category_name": t.category.name if t.category else None
+    } for t in todos]
+    return api_response(data=result)
+
+@app.route('/api/v1/todos', methods=['POST'])
+@login_required
+def api_create_todo():
+    data = request.get_json(silent=True)
+    if not data or not data.get('text', '').strip():
+        return api_response(message="text is required", code=400)
+    todo = Todo(
+        text=data['text'].strip(),
+        done=bool(data.get('done', False)),
+        category_id=data.get('category_id'),
+        owner=current_user
+    )
+    db.session.add(todo)
+    db.session.commit()
+    return api_response(data={"id": todo.id}, message="created", code=201)
+
+@app.route('/api/v1/todos/<int:todo_id>', methods=['PATCH'])
+@login_required
+def api_update_todo(todo_id):
+    todo = Todo.query.get_or_404(todo_id)
+    if todo.user_id != current_user.id:
+        return api_response(message="forbidden", code=403)
+    data = request.get_json(silent=True)
+    if not data:
+        return api_response(message="invalid json", code=400)
+    if 'done' in data:
+        todo.done = bool(data['done'])
+    if 'text' in data:
+        todo.text = data['text'].strip()
+    if 'category_id' in data:
+        todo.category_id = data['category_id']
+    db.session.commit()
+    return api_response(message="updated")
+
+@app.route('/api/v1/todos/<int:todo_id>', methods=['DELETE'])
+@login_required
+def api_delete_todo(todo_id):
+    todo = Todo.query.get_or_404(todo_id)
+    if todo.user_id != current_user.id:
+        return api_response(message="forbidden", code=403)
+    db.session.delete(todo)
+    db.session.commit()
+    return '', 204
+
+# ---------- Category API ----------
+@app.route('/api/v1/categories', methods=['GET'])
+@login_required
+def api_get_categories():
+    cats = Category.query.filter_by(user_id=current_user.id).order_by(Category.id).all()
+    result = [{"id": c.id, "name": c.name} for c in cats]
+    return api_response(data=result)
+
+@app.route('/api/v1/categories', methods=['POST'])
+@login_required
+def api_create_category():
+    data = request.get_json(silent=True)
+    if not data or not data.get('name', '').strip():
+        return api_response(message="name is required", code=400)
+    cat = Category(name=data['name'].strip(), owner=current_user)
+    db.session.add(cat)
+    db.session.commit()
+    return api_response(data={"id": cat.id}, message="created", code=201)
 
 if __name__ == '__main__':
     app.run(debug=True)
