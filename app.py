@@ -5,23 +5,23 @@ from werkzeug.security import generate_password_hash, check_password_hash
 import os
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = os.urandom(24)  # 生产环境建议换成固定字符串或环境变量
+app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dev-secret-key-change-in-prod')
 
-# 数据库配置
 basedir = os.path.abspath(os.path.dirname(__file__))
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///' + os.path.join(basedir, 'todos.db')
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
 db = SQLAlchemy(app)
 login_manager = LoginManager(app)
-login_manager.login_view = 'login'  # 未登录时自动跳转的页面
+login_manager.login_view = 'login'
 
-# 用户模型
+
 class User(UserMixin, db.Model):
     id = db.Column(db.Integer, primary_key=True)
     username = db.Column(db.String(80), unique=True, nullable=False)
     password_hash = db.Column(db.String(256), nullable=False)
     todos = db.relationship('Todo', backref='owner', lazy=True, cascade="all, delete-orphan")
+    categories = db.relationship('Category', backref='owner', lazy=True, cascade="all, delete-orphan")
 
     def set_password(self, password):
         self.password_hash = generate_password_hash(password)
@@ -29,20 +29,30 @@ class User(UserMixin, db.Model):
     def check_password(self, password):
         return check_password_hash(self.password_hash, password)
 
-# 待办模型（新增 user_id 外键）
+
+class Category(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(50), nullable=False)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    todos = db.relationship('Todo', backref='category', lazy=True, cascade="all, delete-orphan")
+
+
 class Todo(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     text = db.Column(db.String(200), nullable=False)
     done = db.Column(db.Boolean, default=False)
     user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    category_id = db.Column(db.Integer, db.ForeignKey('category.id'), nullable=True)
+
 
 @login_manager.user_loader
 def load_user(user_id):
     return User.query.get(int(user_id))
 
-# 初始化数据库
+
 with app.app_context():
     db.create_all()
+
 
 # ==================== 认证路由 ====================
 @app.route('/register', methods=['GET', 'POST'])
@@ -65,6 +75,7 @@ def register():
             return redirect(url_for('login'))
     return render_template_string(REGISTER_HTML)
 
+
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     if current_user.is_authenticated:
@@ -79,27 +90,59 @@ def login():
         flash('用户名或密码错误', 'error')
     return render_template_string(LOGIN_HTML)
 
+
 @app.route('/logout')
 @login_required
 def logout():
     logout_user()
     return redirect(url_for('login'))
 
-# ==================== 核心业务路由（已加权限控制）====================
+
+# ==================== 分类路由 ====================
+@app.route('/category/add', methods=['POST'])
+@login_required
+def add_category():
+    name = request.form.get('name', '').strip()
+    if name:
+        cat = Category(name=name, owner=current_user)
+        db.session.add(cat)
+        db.session.commit()
+    return redirect(url_for('index'))
+
+
+@app.route('/category/delete/<int:cat_id>')
+@login_required
+def delete_category(cat_id):
+    cat = Category.query.get_or_404(cat_id)
+    if cat.user_id != current_user.id:
+        flash('无权操作', 'error')
+    else:
+        db.session.delete(cat)
+        db.session.commit()
+    return redirect(url_for('index'))
+
+
+# ==================== 核心业务路由 ====================
 @app.route('/', methods=['GET', 'POST'])
 @login_required
 def index():
     if request.method == 'POST':
         task = request.form.get('task', '').strip()
+        cat_id = request.form.get('category_id', type=int)
         if task:
-            new_todo = Todo(text=task, done=False, owner=current_user)
+            new_todo = Todo(text=task, done=False, owner=current_user, category_id=cat_id)
             db.session.add(new_todo)
             db.session.commit()
         return redirect(url_for('index'))
 
-    # 只查询当前用户的待办
-    todos = Todo.query.filter_by(user_id=current_user.id).order_by(Todo.id.desc()).all()
-    return render_template_string(INDEX_HTML, todos=todos)
+    filter_cat = request.args.get('cat', type=int)
+    query = Todo.query.filter_by(user_id=current_user.id)
+    if filter_cat:
+        query = query.filter_by(category_id=filter_cat)
+    todos = query.order_by(Todo.id.desc()).all()
+    categories = Category.query.filter_by(user_id=current_user.id).order_by(Category.id).all()
+    return render_template_string(INDEX_HTML, todos=todos, categories=categories, filter_cat=filter_cat)
+
 
 @app.route('/delete/<int:todo_id>')
 @login_required
@@ -111,6 +154,7 @@ def delete(todo_id):
     db.session.delete(todo)
     db.session.commit()
     return redirect(url_for('index'))
+
 
 @app.route('/toggle/<int:todo_id>', methods=['POST'])
 @login_required
@@ -125,23 +169,32 @@ def toggle(todo_id):
     db.session.commit()
     return {'status': 'ok'}
 
+
 # ==================== HTML 模板 ====================
 BASE_STYLE = '''
 <style>
-    body { font-family: Arial; max-width: 500px; margin: 50px auto; padding: 0 20px; }
+    body { font-family: Arial; max-width: 600px; margin: 50px auto; padding: 0 20px; }
     ul { list-style: none; padding: 0; }
     li { margin: 10px 0; padding: 8px; background: #f5f5f5; border-radius: 5px; display: flex; align-items: center; }
     li span { flex: 1; }
     .done { text-decoration: line-through; color: #999; }
     .delete { color: red; text-decoration: none; margin-left: 15px; white-space: nowrap; }
     input[type="checkbox"] { margin-right: 10px; cursor: pointer; }
-    form { display: flex; gap: 8px; margin-bottom: 20px; }
-    form input[type="text"], form input[type="password"] { flex: 1; padding: 8px; }
+    form { display: flex; gap: 8px; margin-bottom: 20px; flex-wrap: wrap; }
+    form input[type="text"], form input[type="password"] { flex: 1; padding: 8px; min-width: 120px; }
+    form select { padding: 8px; }
     form button { padding: 8px 16px; cursor: pointer; }
     .flash-error { color: red; margin-bottom: 10px; }
     .flash-success { color: green; margin-bottom: 10px; }
     .nav { margin-bottom: 20px; display: flex; justify-content: space-between; align-items: center; }
     .nav a { text-decoration: none; color: #333; margin-left: 15px; }
+    .cat-filter { margin-bottom: 15px; display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+    .cat-filter a { padding: 4px 12px; border-radius: 15px; text-decoration: none; font-size: 14px; background: #eee; color: #333; }
+    .cat-filter a.active { background: #333; color: #fff; }
+    .cat-tag { font-size: 12px; color: #666; background: #e0e0e0; padding: 2px 8px; border-radius: 10px; margin-left: 8px; }
+    .add-cat-form { display: flex; gap: 8px; margin-bottom: 15px; }
+    .add-cat-form input { flex: 1; padding: 6px; }
+    .add-cat-form button { padding: 6px 12px; cursor: pointer; font-size: 14px; }
 </style>
 '''
 
@@ -184,29 +237,58 @@ INDEX_HTML = f'''<!DOCTYPE html><html><head><title>我的待办</title>{BASE_STY
 </div>
 <h1>待办清单</h1>
 {FLASH_MESSAGES}
+
+<div class="add-cat-form">
+    <form method="POST" action="{{{{ url_for('add_category') }}}}" style="margin-bottom:0;flex:1;">
+        <input type="text" name="name" placeholder="新建分类..." required>
+        <button type="submit">+ 分类</button>
+    </form>
+</div>
+
+<div class="cat-filter">
+    <a href="{{{{ url_for('index') }}}}" class="{{{{ 'active' if not filter_cat else '' }}}}">全部</a>
+    {{% for c in categories %}}
+        <a href="{{{{ url_for('index', cat=c.id) }}}}" class="{{{{ 'active' if filter_cat == c.id else '' }}}}">
+            {{{{ c.name }}}}
+        </a>
+        <a href="/category/delete/{{{{ c.id }}}}" onclick="return confirm('删除分类会同时删除该分类下所有待办，确定吗？')" style="background:none;color:red;padding:0 4px;font-size:12px;">✕</a>
+    {{% endfor %}}
+</div>
+
 <form method="POST">
     <input type="text" name="task" placeholder="写个任务..." required>
+    <select name="category_id">
+        <option value="">无分类</option>
+        {{% for c in categories %}}
+            <option value="{{{{ c.id }}}}">{{{{ c.name }}}}</option>
+        {{% endfor %}}
+    </select>
     <button type="submit">添加</button>
 </form>
+
 <ul>
     {{% for t in todos %}}
         <li>
             <input type="checkbox" onchange="toggleDone({{{{ t.id }}}}, this.checked)" {{{{ 'checked' if t.done else '' }}}}>
-            <span class="{{{{ 'done' if t.done else '' }}}}">{{{{ t.text }}}}</span>
+            <span class="{{{{ 'done' if t.done else '' }}}}">
+                {{{{ t.text }}}}
+                {{% if t.category %}}<span class="cat-tag">{{{{ t.category.name }}}}</span>{{% endif %}}
+            </span>
             <a href="/delete/{{{{ t.id }}}}" class="delete" onclick="return confirm('确定删除吗？')">删除</a>
         </li>
     {{% endfor %}}
 </ul>
 {{% if not todos %}}<p style="color:#999; text-align:center;">暂无待办事项 🎉</p>{{% endif %}}
+
 <script>
 function toggleDone(id, isDone) {{
     fetch('/toggle/' + id, {{
         method: 'POST',
         headers: {{ 'Content-Type': 'application/json' }},
         body: JSON.stringify({{ done: isDone }})
-    }}).then(function(response) {{
-        if (response.ok) {{ window.location.replace(window.location.href); }}
-        else {{ alert('操作失败'); }}
+    }}).then(function(r) {{
+        if (r.ok) window.location.replace(window.location.href);
+        else alert('操作失败');
     }});
 }}
 </script>
