@@ -55,8 +55,41 @@ def load_user(user_id):
     return User.query.get(int(user_id))
 
 
-with app.app_context():
-    db.create_all()
+import sqlite3
+
+def init_db():
+    """安全初始化数据库，避免多Worker并发建表冲突"""
+    with app.app_context():
+        try:
+            db.create_all()
+        except Exception as e:
+            # 如果表已存在则忽略，仅记录警告
+            if "already exists" in str(e):
+                print("⚠️ 数据库表已存在，跳过创建")
+            else:
+                raise
+
+# 仅在非Gunicorn环境下自动建表（开发模式）
+# Gunicorn环境下通过preload或外部脚本初始化
+if __name__ == '__main__':
+    init_db()
+    app.run(debug=True)
+else:
+    # Gunicorn环境：使用before_first_request等效机制
+    # Flask 2.3+ 移除了 before_first_request，改用一次性初始化
+    import threading
+    _db_initialized = False
+    _init_lock = threading.Lock()
+
+    @app.before_request
+    def ensure_db_initialized():
+        global _db_initialized
+        if not _db_initialized:
+            with _init_lock:
+                if not _db_initialized:
+                    init_db()
+                    _db_initialized = True
+
 
 
 # ==================== 认证路由 ====================
