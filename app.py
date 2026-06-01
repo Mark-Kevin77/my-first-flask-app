@@ -1,7 +1,8 @@
-from flask import Flask, request, render_template_string, redirect, url_for, flash
+from flask import Flask, request, render_template_string, redirect, url_for, flash, jsonify
 from flask_sqlalchemy import SQLAlchemy
 from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
 from werkzeug.security import generate_password_hash, check_password_hash
+from datetime import datetime, timezone
 import os
 
 app = Flask(__name__)
@@ -12,8 +13,10 @@ app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///' + os.path.join(basedir, 'to
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
 db = SQLAlchemy(app)
+
 login_manager = LoginManager(app)
 login_manager.login_view = 'login'
+
 @login_manager.unauthorized_handler
 def unauthorized():
     if request.path.startswith('/api/'):
@@ -21,6 +24,7 @@ def unauthorized():
     return redirect(url_for('login'))
 
 
+# ==================== 数据模型 ====================
 class User(UserMixin, db.Model):
     id = db.Column(db.Integer, primary_key=True)
     username = db.Column(db.String(80), unique=True, nullable=False)
@@ -48,14 +52,39 @@ class Todo(db.Model):
     done = db.Column(db.Boolean, default=False)
     user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
     category_id = db.Column(db.Integer, db.ForeignKey('category.id'), nullable=True)
+    # 软删除字段
+    is_deleted = db.Column(db.Boolean, default=False, nullable=False)
+    deleted_at = db.Column(db.DateTime, nullable=True)
 
 
+# ==================== 全局软删除过滤器 ====================
+# 使用 SQLAlchemy 事件监听器，兼容 Flask-SQLAlchemy 3.x
+from sqlalchemy import event
+from sqlalchemy.orm import Query
+
+@event.listens_for(Query, "before_compile", retval=True)
+def _soft_delete_filter(query):
+    """在所有 Todo 查询编译前自动追加 is_deleted=False 条件"""
+    # 检查查询实体是否包含 Todo
+    for entity in query.column_descriptions:
+        if entity.get('entity') == Todo:
+            # 避免重复添加过滤条件
+            already_filtered = any(
+                hasattr(crit, 'left') and 
+                getattr(crit.left, 'key', None) == 'is_deleted'
+                for crit in query._where_criteria
+            )
+            if not already_filtered:
+                query = query.filter(Todo.is_deleted == False)
+            break
+    return query
+
+
+
+# ==================== 数据库安全初始化 ====================
 @login_manager.user_loader
 def load_user(user_id):
     return User.query.get(int(user_id))
-
-
-import sqlite3
 
 def init_db():
     """安全初始化数据库，避免多Worker并发建表冲突"""
@@ -63,20 +92,14 @@ def init_db():
         try:
             db.create_all()
         except Exception as e:
-            # 如果表已存在则忽略，仅记录警告
             if "already exists" in str(e):
                 print("⚠️ 数据库表已存在，跳过创建")
             else:
                 raise
 
-# 仅在非Gunicorn环境下自动建表（开发模式）
-# Gunicorn环境下通过preload或外部脚本初始化
 if __name__ == '__main__':
     init_db()
-    app.run(debug=True)
 else:
-    # Gunicorn环境：使用before_first_request等效机制
-    # Flask 2.3+ 移除了 before_first_request，改用一次性初始化
     import threading
     _db_initialized = False
     _init_lock = threading.Lock()
@@ -90,6 +113,10 @@ else:
                     init_db()
                     _db_initialized = True
 
+
+# ==================== 统一 JSON 响应封装 ====================
+def api_response(data=None, message="ok", code=200):
+    return jsonify({"code": code, "message": message, "data": data}), code
 
 
 # ==================== 认证路由 ====================
@@ -189,7 +216,10 @@ def delete(todo_id):
     if todo.user_id != current_user.id:
         flash('无权操作他人的待办', 'error')
         return redirect(url_for('index'))
-    db.session.delete(todo)
+    
+    # 页面路由改为软删除
+    todo.is_deleted = True
+    todo.deleted_at = datetime.now(timezone.utc)
     db.session.commit()
     return redirect(url_for('index'))
 
@@ -206,6 +236,111 @@ def toggle(todo_id):
     todo.done = bool(data.get('done', False))
     db.session.commit()
     return {'status': 'ok'}
+
+
+# ==================== RESTful API ====================
+@app.route('/api/v1/todos', methods=['GET'])
+@login_required
+def api_get_todos():
+    cat_id = request.args.get('cat', type=int)
+    query = Todo.query.filter_by(user_id=current_user.id)
+    if cat_id:
+        query = query.filter_by(category_id=cat_id)
+    todos = query.order_by(Todo.id.desc()).all()
+    result = [{
+        "id": t.id,
+        "text": t.text,
+        "done": t.done,
+        "category_id": t.category_id,
+        "category_name": t.category.name if t.category else None
+    } for t in todos]
+    return api_response(data=result)
+
+@app.route('/api/v1/todos', methods=['POST'])
+@login_required
+def api_create_todo():
+    data = request.get_json(silent=True)
+    if not data or not data.get('text', '').strip():
+        return api_response(message="text is required", code=400)
+    todo = Todo(
+        text=data['text'].strip(),
+        done=bool(data.get('done', False)),
+        category_id=data.get('category_id'),
+        owner=current_user
+    )
+    db.session.add(todo)
+    db.session.commit()
+    return api_response(data={"id": todo.id}, message="created", code=201)
+
+@app.route('/api/v1/todos/<int:todo_id>', methods=['PATCH'])
+@login_required
+def api_update_todo(todo_id):
+    todo = Todo.query.get_or_404(todo_id)
+    if todo.user_id != current_user.id:
+        return api_response(message="forbidden", code=403)
+    data = request.get_json(silent=True)
+    if not data:
+        return api_response(message="invalid json", code=400)
+    if 'done' in data:
+        todo.done = bool(data['done'])
+    if 'text' in data:
+        todo.text = data['text'].strip()
+    if 'category_id' in data:
+        todo.category_id = data['category_id']
+    db.session.commit()
+    return api_response(message="updated")
+
+@app.route('/api/v1/todos/<int:todo_id>', methods=['DELETE'])
+@login_required
+def api_delete_todo(todo_id):
+    todo = Todo.query.get_or_404(todo_id)
+    if todo.user_id != current_user.id:
+        return api_response(message="forbidden", code=403)
+    
+    # API 路由改为软删除
+    todo.is_deleted = True
+    todo.deleted_at = datetime.now(timezone.utc)
+    db.session.commit()
+    return '', 204
+
+@app.route('/api/v1/todos/<int:todo_id>/restore', methods=['POST'])
+@login_required
+def api_restore_todo(todo_id):
+    """恢复被软删除的待办事项"""
+    from sqlalchemy import select
+    
+    # 使用原生 select 绕过全局软删除过滤器
+    stmt = select(Todo).where(
+        Todo.id == todo_id,
+        Todo.user_id == current_user.id
+    )
+    todo = db.session.execute(stmt).scalar_one_or_none()
+    
+    if not todo or not todo.is_deleted:
+        return api_response(message="todo not found or not deleted", code=404)
+    
+    todo.is_deleted = False
+    todo.deleted_at = None
+    db.session.commit()
+    return api_response(message="restored", code=200)
+
+@app.route('/api/v1/categories', methods=['GET'])
+@login_required
+def api_get_categories():
+    cats = Category.query.filter_by(user_id=current_user.id).order_by(Category.id).all()
+    result = [{"id": c.id, "name": c.name} for c in cats]
+    return api_response(data=result)
+
+@app.route('/api/v1/categories', methods=['POST'])
+@login_required
+def api_create_category():
+    data = request.get_json(silent=True)
+    if not data or not data.get('name', '').strip():
+        return api_response(message="name is required", code=400)
+    cat = Category(name=data['name'].strip(), owner=current_user)
+    db.session.add(cat)
+    db.session.commit()
+    return api_response(data={"id": cat.id}, message="created", code=201)
 
 
 # ==================== HTML 模板 ====================
@@ -332,94 +467,5 @@ function toggleDone(id, isDone) {{
 </script>
 </body></html>'''
 
-# ==================== P4: RESTful API ====================
-from flask import jsonify
-
-# 统一 JSON 响应封装
-def api_response(data=None, message="ok", code=200):
-    return jsonify({"code": code, "message": message, "data": data}), code
-
-# ---------- Todo API ----------
-@app.route('/api/v1/todos', methods=['GET'])
-@login_required
-def api_get_todos():
-    cat_id = request.args.get('cat', type=int)
-    query = Todo.query.filter_by(user_id=current_user.id)
-    if cat_id:
-        query = query.filter_by(category_id=cat_id)
-    todos = query.order_by(Todo.id.desc()).all()
-    result = [{
-        "id": t.id,
-        "text": t.text,
-        "done": t.done,
-        "category_id": t.category_id,
-        "category_name": t.category.name if t.category else None
-    } for t in todos]
-    return api_response(data=result)
-
-@app.route('/api/v1/todos', methods=['POST'])
-@login_required
-def api_create_todo():
-    data = request.get_json(silent=True)
-    if not data or not data.get('text', '').strip():
-        return api_response(message="text is required", code=400)
-    todo = Todo(
-        text=data['text'].strip(),
-        done=bool(data.get('done', False)),
-        category_id=data.get('category_id'),
-        owner=current_user
-    )
-    db.session.add(todo)
-    db.session.commit()
-    return api_response(data={"id": todo.id}, message="created", code=201)
-
-@app.route('/api/v1/todos/<int:todo_id>', methods=['PATCH'])
-@login_required
-def api_update_todo(todo_id):
-    todo = Todo.query.get_or_404(todo_id)
-    if todo.user_id != current_user.id:
-        return api_response(message="forbidden", code=403)
-    data = request.get_json(silent=True)
-    if not data:
-        return api_response(message="invalid json", code=400)
-    if 'done' in data:
-        todo.done = bool(data['done'])
-    if 'text' in data:
-        todo.text = data['text'].strip()
-    if 'category_id' in data:
-        todo.category_id = data['category_id']
-    db.session.commit()
-    return api_response(message="updated")
-
-@app.route('/api/v1/todos/<int:todo_id>', methods=['DELETE'])
-@login_required
-def api_delete_todo(todo_id):
-    todo = Todo.query.get_or_404(todo_id)
-    if todo.user_id != current_user.id:
-        return api_response(message="forbidden", code=403)
-    db.session.delete(todo)
-    db.session.commit()
-    return '', 204
-
-# ---------- Category API ----------
-@app.route('/api/v1/categories', methods=['GET'])
-@login_required
-def api_get_categories():
-    cats = Category.query.filter_by(user_id=current_user.id).order_by(Category.id).all()
-    result = [{"id": c.id, "name": c.name} for c in cats]
-    return api_response(data=result)
-
-@app.route('/api/v1/categories', methods=['POST'])
-@login_required
-def api_create_category():
-    data = request.get_json(silent=True)
-    if not data or not data.get('name', '').strip():
-        return api_response(message="name is required", code=400)
-    cat = Category(name=data['name'].strip(), owner=current_user)
-    db.session.add(cat)
-    db.session.commit()
-    return api_response(data={"id": cat.id}, message="created", code=201)
-
 if __name__ == '__main__':
     app.run(debug=True)
-
