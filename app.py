@@ -242,19 +242,45 @@ def toggle(todo_id):
 @app.route('/api/v1/todos', methods=['GET'])
 @login_required
 def api_get_todos():
-    cat_id = request.args.get('cat', type=int)
-    query = Todo.query.filter_by(user_id=current_user.id)
-    if cat_id:
-        query = query.filter_by(category_id=cat_id)
-    todos = query.order_by(Todo.id.desc()).all()
-    result = [{
-        "id": t.id,
-        "text": t.text,
-        "done": t.done,
-        "category_id": t.category_id,
-        "category_name": t.category.name if t.category else None
-    } for t in todos]
+    # 1. 解析参数并设置安全上限
+    page = request.args.get('page', 1, type=int)
+    per_page = min(request.args.get('per_page', 20, type=int), 100)
+    keyword = request.args.get('q', '', type=str).strip()
+    
+    # 2. 构建基础查询（显式过滤已删除数据，避免依赖全局监听器）
+    query = Todo.query.filter_by(user_id=current_user.id, is_deleted=False)
+    
+    # 3. 【关键】在 paginate 之前追加搜索条件
+    if keyword:
+        query = query.filter(Todo.text.ilike(f'%{keyword}%'))
+    
+    # 4. 排序必须在 paginate 之前
+    query = query.order_by(Todo.id.desc())
+    
+    # 5. 最后才执行分页
+    pagination = query.paginate(page=page, per_page=per_page, error_out=False)
+    
+    # 6. 组装响应
+    result = {
+        "items": [{
+            "id": t.id,
+            "text": t.text,
+            "done": t.done,
+            "category_id": t.category_id,
+            "category_name": t.category.name if t.category else None
+        } for t in pagination.items],
+        "pagination": {
+            "page": pagination.page,
+            "per_page": pagination.per_page,
+            "total": pagination.total,
+            "pages": pagination.pages,
+            "has_next": pagination.has_next,
+            "has_prev": pagination.has_prev
+        }
+    }
     return api_response(data=result)
+
+
 
 @app.route('/api/v1/todos', methods=['POST'])
 @login_required
