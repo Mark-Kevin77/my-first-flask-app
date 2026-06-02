@@ -5,6 +5,48 @@ from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import datetime, timezone
 import os
 
+import time
+from functools import wraps
+from collections import defaultdict
+import threading
+
+class RateLimiter:
+    """线程安全的滑动窗口限流器"""
+    def __init__(self, max_requests=30, window_seconds=60):
+        self.max_requests = max_requests
+        self.window_seconds = window_seconds
+        self._requests = defaultdict(list)  # key -> [timestamp, ...]
+        self._lock = threading.Lock()
+
+    def is_allowed(self, key):
+        now = time.time()
+        cutoff = now - self.window_seconds
+        with self._lock:
+            # 清理过期记录
+            self._requests[key] = [t for t in self._requests[key] if t > cutoff]
+            if len(self._requests[key]) >= self.max_requests:
+                return False
+            self._requests[key].append(now)
+            return True
+
+# 全局限流器实例：每分钟最多30次请求
+todo_limiter = RateLimiter(max_requests=30, window_seconds=60)
+
+def rate_limit(limiter, key_func):
+    """限流装饰器"""
+    def decorator(f):
+        @wraps(f)
+        def wrapped(*args, **kwargs):
+            key = key_func()
+            allowed = limiter.is_allowed(key)
+            if not allowed:
+                return api_response(message="too many requests", code=429)
+            return f(*args, **kwargs)
+        return wrapped
+    return decorator
+
+
+
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dev-secret-key-change-in-prod')
 
@@ -84,7 +126,7 @@ def _soft_delete_filter(query):
 # ==================== 数据库安全初始化 ====================
 @login_manager.user_loader
 def load_user(user_id):
-    return User.query.get(int(user_id))
+    return db.session.get(User, int(user_id))
 
 def init_db():
     """安全初始化数据库，避免多Worker并发建表冲突"""
@@ -241,6 +283,7 @@ def toggle(todo_id):
 # ==================== RESTful API ====================
 @app.route('/api/v1/todos', methods=['GET'])
 @login_required
+@rate_limit(todo_limiter, key_func=lambda: f"todo:{current_user.id}")
 def api_get_todos():
     # 1. 解析参数并设置安全上限
     page = request.args.get('page', 1, type=int)
