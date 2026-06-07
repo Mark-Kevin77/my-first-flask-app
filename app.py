@@ -10,6 +10,41 @@ from functools import wraps
 from collections import defaultdict
 import threading
 
+import queue
+import threading
+import logging
+
+# 配置日志
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class AsyncTaskQueue:
+    """轻量级后台任务队列，零外部依赖"""
+    def __init__(self, num_workers=2):
+        self._queue = queue.Queue()
+        self._workers = []
+        for i in range(num_workers):
+            t = threading.Thread(target=self._worker_loop, daemon=True)
+            t.start()
+            self._workers.append(t)
+
+    def _worker_loop(self):
+        while True:
+            task, args, kwargs = self._queue.get()
+            try:
+                task(*args, **kwargs)
+            except Exception as e:
+                logger.error(f"Async task failed: {e}")
+            finally:
+                self._queue.task_done()
+
+    def submit(self, task, *args, **kwargs):
+        self._queue.put((task, args, kwargs))
+
+# 全局任务队列实例
+task_queue = AsyncTaskQueue(num_workers=2)
+
+
 class RateLimiter:
     """线程安全的滑动窗口限流器"""
     def __init__(self, max_requests=30, window_seconds=60):
@@ -162,6 +197,12 @@ def api_response(data=None, message="ok", code=200):
 
 
 # ==================== 认证路由 ====================
+def send_welcome_email(username, email_addr):
+    """模拟发送邮件（实际项目中替换为 SMTP/API 调用）"""
+    import time
+    time.sleep(3)  # 模拟网络 IO 耗时
+    logger.info(f"✅ Welcome email sent to {username} ({email_addr})")
+
 @app.route('/register', methods=['GET', 'POST'])
 def register():
     if current_user.is_authenticated:
@@ -178,6 +219,7 @@ def register():
             user.set_password(password)
             db.session.add(user)
             db.session.commit()
+            task_queue.submit(send_welcome_email, username, "user@example.com")
             flash('注册成功，请登录', 'success')
             return redirect(url_for('login'))
     return render_template_string(REGISTER_HTML)
